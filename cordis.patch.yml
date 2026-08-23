@@ -1,0 +1,9 @@
+- insert:
+    - id: dafeiyu-buchibaifan
+      name: dafeiyu-buchibaifan
+      config:
+        enabled: true
+        scale: 1
+        activityLevel: normal
+        reducedMotion: false
+        includeSubagents: false
