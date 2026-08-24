@@ -1,13 +1,13 @@
 <div align="center">
 
-# BigFish: No Free Lunch Edition 🐋
+# BigFish: No Free Lunch Edition 馃悑
 
 **An agent companion that lives on your Windows desktop and is driven by the real work state
-of DeepSeek Harness — enhanced edition.**
+of DeepSeek Harness 鈥?enhanced edition.**
 
 Free community welfare maintained by **Piaobo_GZ**, for everyone to use and remix.
 
-[Changelog](CHANGELOG.md) · [中文说明](README.md)
+[Changelog](CHANGELOG.md) 路 [涓枃璇存槑](README.md)
 
 </div>
 
@@ -15,18 +15,18 @@ Free community welfare maintained by **Piaobo_GZ**, for everyone to use and remi
 > **real-time balance queries**, **out-of-browser desktop Q&A**, **7 custom animations** and
 > **53 meme lines**.
 
-## ✨ Enhancements
+## 鉁?Enhancements
 
 | Feature | Description |
 |---|---|
-| **Real-time balance** | Click BigFish → shows your DeepSeek account balance (¥ + granted/topped-up breakdown) |
-| **Desktop Q&A** | When the agent asks a question, answer right in the desktop bubble: single-choice / multi-choice / free input — no need to switch back to the browser |
+| **Real-time balance** | Click BigFish 鈫?shows your DeepSeek account balance (楼 + granted/topped-up breakdown) |
+| **Desktop Q&A** | When the agent asks a question, answer right in the desktop bubble: single-choice / multi-choice / free input 鈥?no need to switch back to the browser |
 | **One question at a time** | Multi-question batches pop one by one (question X/Y); answer each and the next appears, then everything is submitted at once |
 | **Answer in browser** | One click restores/raises the DSH browser window (reuses the existing tab, never opens a new one) |
 | **7 custom animations** | Touch face / wave hand / tail poke / sweep / stomp foot / angry / happy (dedicated frame animations) |
 | **53 meme lines** | Body-part themed "blue big fish who eats free rice" meme pool; from the 3rd click on the same part it draws from the whole pool |
 | **Bubble card UI** | Rounded white card + pointing tail + soft drop shadow, follows the pet, flips below when near the screen top |
-| **Cute rounded look** | 幼圆 (Yuanti) font, gradient rounded buttons, rounded input fields, long text auto-wraps |
+| **Cute rounded look** | 骞煎渾 (Yuanti) font, gradient rounded buttons, rounded input fields, long text auto-wraps |
 
 ## Interaction rules
 
@@ -44,7 +44,7 @@ Free community welfare maintained by **Piaobo_GZ**, for everyone to use and remi
 When the agent calls `ask_user_question`:
 
 - A rounded bubble card (white + pointing tail + shadow) appears above BigFish, which switches to a waiting pose
-- **Single choice** → radio options; **multi-choice** → checkboxes; **no options** → text input
+- **Single choice** 鈫?radio options; **multi-choice** 鈫?checkboxes; **no options** 鈫?text input
 - Every question offers "skip" and "answer in browser"
 - Once all questions are answered, everything is submitted in one request and the agent continues
 
@@ -61,10 +61,10 @@ When the agent calls `ask_user_question`:
 dsh plugin --profile web add @piaobo_gz/dafeiyu-buchibaifan
 
 # Or from a local .tgz
-dsh plugin --profile web add "C:\path\piaobo_gz-dafeiyu-buchibaifan-1.0.1.tgz"
+dsh plugin --profile web add "C:\path\piaobo_gz-dafeiyu-buchibaifan-1.0.2.tgz"
 ```
 
-Restart DSH after installing — BigFish appears at the bottom-right of the desktop.
+Restart DSH after installing 鈥?BigFish appears at the bottom-right of the desktop.
 
 ## Balance configuration
 
@@ -86,9 +86,9 @@ npm run build:helper:windows
 ## Assets & meme pool
 
 - Animation frames: `assets/pet/` (7 custom-drawn animations + the original frames); `pet-manifest.json` defines the animation tracks
-- Meme lines: the `PLAYFUL_*` lists at the top of `runtime/helper.py` (53 lines — feel free to add your own)
+- Meme lines: the `PLAYFUL_*` lists at the top of `runtime/helper.py` (53 lines 鈥?feel free to add your own)
 - To customize: edit `runtime/helper.py` and rebuild the Helper
 
 ## License
 
-MIT — free community welfare. Use it, remix it, share it.
+MIT 鈥?free community welfare. Use it, remix it, share it.

@@ -182,11 +182,14 @@ def fetch_balance() -> tuple[bool, str, str]:
     if not api_key:
         return False, "余额查询未配置", "在 DSH 设置中配置 DEEPSEEK_API_KEY 后重启"
     try:
+        # Bypass system/env proxies: api.deepseek.com is reachable directly
+        # from CN networks, and the local proxy path adds 4-5 s per call.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         request = urllib.request.Request(
             BALANCE_URL,
             headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with opener.open(request, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
         infos = data.get("balance_infos") or []
         if not infos:
@@ -420,6 +423,11 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             "DISCONNECTED": "已断开",
         }
 
+        # Balance lookups run on a worker thread so the pet stays animated
+        # while the HTTPS request is in flight; the result arrives through
+        # this queued signal on the GUI thread.
+        balance_result = Signal(bool, str, str)
+
         def __init__(self) -> None:
             super().__init__()
             self.layout_path = default_layout_path()
@@ -482,6 +490,15 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.task_active = False
             self.last_click_ms = 0
             self.SESSION_COOLDOWN_MS = 6000
+            # Async balance fetch state: at most one lookup in flight, with the
+            # click context captured so the failure fallback still knows where
+            # the user clicked when the result arrives.
+            self._balance_pending = False
+            self._balance_click_ctx = (0.0, 0.0, 0, 0)
+            self._balance_fetch_click = -1
+            self._balance_cache: tuple[int, bool, str, str] | None = None
+            self.BALANCE_CACHE_TTL_MS = 60_000
+            self.balance_result.connect(self._on_balance_result)
             # Per-body-part click counter: first TWO clicks of a part use its
             # own quip pool, from the THIRD the line comes from the full pool.
             self.zone_clicks: dict[str, int] = {}
@@ -1400,14 +1417,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self.zone_clicks = {}
 
             if fresh_session:
-                ok, title, detail = fetch_balance()
-                if ok:
-                    self.model.play_overlay("head_pat")
-                    self._show_overlay(title, detail, "SUCCESS", 4000)
-                elif not self.task_active:
-                    self._play_playful_line(relative_x, relative_y, pet_width, pet_height)
-                else:
-                    self._show_overlay(title, detail, self.status_state, 3000)
+                self._start_balance_fetch(relative_x, relative_y, pet_width, pet_height)
                 return
 
             # Inside the session: task progress wins while active, otherwise
@@ -1416,6 +1426,49 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self._show_task_progress()
                 return
             self._play_playful_line(relative_x, relative_y, pet_width, pet_height)
+
+        def _start_balance_fetch(self, x: float, y: float, w: int, h: int, quiet: bool = False) -> None:
+            if self._balance_pending:
+                return
+            cached = self._balance_cache
+            if cached is not None and self._now_ms() - cached[0] < self.BALANCE_CACHE_TTL_MS:
+                self._present_balance(cached[1], cached[2], cached[3])
+                return
+            self._balance_pending = True
+            # Prefetch (-1) never matches last_click_ms, so its result is
+            # cached but never popped on screen. A user click pins the click
+            # timestamp: if the user clicks again before the lookup lands, the
+            # result is cached only and does not stomp the meme in progress.
+            self._balance_fetch_click = -1 if quiet else self.last_click_ms
+            self._balance_click_ctx = (x, y, w, h)
+            if not quiet:
+                self._show_overlay("查询余额中…", "正在获取 DeepSeek 账户余额", self.status_state, 1500)
+            threading.Thread(target=self._fetch_balance_worker, name="dsh-bigfish-balance", daemon=True).start()
+
+        def _fetch_balance_worker(self) -> None:
+            try:
+                ok, title, detail = fetch_balance()
+            except Exception:
+                ok, title, detail = False, "余额查询失败", "网络异常，请稍后再试"
+            self.balance_result.emit(ok, title, detail)
+
+        def _on_balance_result(self, ok: bool, title: str, detail: str) -> None:
+            self._balance_pending = False
+            self._balance_cache = (self._now_ms(), ok, title, detail)
+            if self.last_click_ms != self._balance_fetch_click:
+                return
+            self._present_balance(ok, title, detail)
+
+        def _present_balance(self, ok: bool, title: str, detail: str) -> None:
+            if ok:
+                self.model.play_overlay("head_pat")
+                self._show_overlay(title, detail, "SUCCESS", 4000)
+                return
+            x, y, w, h = self._balance_click_ctx
+            if not self.task_active:
+                self._play_playful_line(x, y, w, h)
+            else:
+                self._show_overlay(title, detail, self.status_state, 3000)
 
         def _show_task_progress(self) -> None:
             self.model.play_overlay("poke")
@@ -1543,6 +1596,8 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
     window = CompanionWindow()
     inbox.message.connect(window.apply_message)
     inbox.closed.connect(application.quit)
+    # Warm the balance cache shortly after startup so the first click is instant.
+    QTimer.singleShot(1200, lambda: window._start_balance_fetch(0, 0, 0, 0, quiet=True))
 
     def read_stdin() -> None:
         for line in sys.stdin:
