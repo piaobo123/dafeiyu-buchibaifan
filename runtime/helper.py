@@ -248,7 +248,10 @@ def run_headless(recorder: EventRecorder) -> int:
 def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, question_snapshot_path: Path | None = None) -> int:
     try:
         from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
-        from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+        from PySide6.QtGui import (
+            QBitmap, QColor, QFont, QFontMetrics, QMouseEvent, QPainter,
+            QPainterPath, QPen, QPixmap, QPolygonF, QRegion,
+        )
         from PySide6.QtWidgets import (
             QApplication, QButtonGroup, QCheckBox, QDialog, QGraphicsDropShadowEffect,
             QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QRadioButton,
@@ -307,13 +310,42 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
     class BubbleCard(QWidget):
         """Card rendered from the hand-drawn bubble image, drawn as a 9-slice
         (border-image style): the drawn border and corners stay crisp while the
-        middle stretches, so any content fits inside the bubble shell."""
+        middle stretches, so any content fits inside the bubble shell.
+
+        The artwork is only ~84% opaque inside its outline (bubble.png alpha
+        214), so drawing it as-is let the desktop show straight through the
+        card — the "气泡透明" regression the 1.0.0 changelog had already fixed
+        once. Every card therefore paints `_opaque_art()` instead of the raw
+        pixmap: the interior is sealed solid, the artwork's soft outer fringe
+        is left untouched.
+        """
         SLICE = 30
 
         def __init__(self) -> None:
             super().__init__()
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self._bubble = QPixmap(str(bundle_root() / "assets" / "bubble.png"))
+            self._bubble = self._opaque_art(QPixmap(str(bundle_root() / "assets" / "bubble.png")))
+
+        @staticmethod
+        def _opaque_art(art: QPixmap) -> QPixmap:
+            """Return the bubble art with a fully opaque interior.
+
+            Everything inside the artwork's 50%-alpha contour is composited
+            over itself until the alpha saturates (0.84 -> 1-(0.16^6) is
+            opaque to the last bit), so nothing behind the card can bleed
+            through its text. The clip keeps the soft outer fringe exactly as
+            drawn, so the hand-drawn edge stays anti-aliased.
+            """
+            if art.isNull():
+                return art
+            sealed = QPixmap(art)
+            mask = art.toImage().createAlphaMask()
+            painter = QPainter(sealed)
+            painter.setClipRegion(QRegion(QBitmap.fromImage(mask)))
+            for _ in range(6):
+                painter.drawPixmap(0, 0, art)
+            painter.end()
+            return sealed
 
         def paintEvent(self, _event: Any) -> None:
             p = QPainter(self)
@@ -348,11 +380,12 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
     class QuestionBubble(QWidget):
         """Standalone question bubble window.
 
-        Uses ONLY standard Qt mechanisms that PyInstaller renders reliably:
-        the rounded card is a QWidget with a QSS white rounded background, the
-        pointer tail is a QLabel showing a pre-rendered triangle QPixmap, and
-        the soft shadow is a QGraphicsDropShadowEffect. No paintEvent
-        override, so the card can never render transparent.
+        The rounded card is a BubbleCard (the hand-drawn bubble art painted as
+        a 9-slice with a sealed, fully opaque interior), the pointer tail is a
+        QLabel showing a pre-rendered triangle QPixmap, and the soft shadow is
+        a QGraphicsDropShadowEffect. The card background must never be
+        see-through: a translucent card lets the desktop bleed through the
+        question text.
         """
 
         TAIL_H = 20
