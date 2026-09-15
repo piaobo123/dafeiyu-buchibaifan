@@ -245,7 +245,7 @@ def run_headless(recorder: EventRecorder) -> int:
     return 0
 
 
-def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> int:
+def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, question_snapshot_path: Path | None = None) -> int:
     try:
         from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
         from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
@@ -275,6 +275,76 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
         recorder.close()
         return 2
 
+    def _wobbly_rounded_rect(x0: float, y0: float, w: float, h: float,
+                             radius: float, seed: int = 0, wobble: float = 2.2) -> QPainterPath:
+        """Return a wobbly rounded-rectangle path that reads as hand-drawn.
+
+        Corner anchors and edge mid-points are jittered by a deterministic
+        seed, then joined with quadratic curves, so the outline sways
+        slightly like a sketched bubble instead of a crisp machine frame.
+        """
+        import random
+        rnd = random.Random(seed)
+        x1, y1 = x0 + w, y0 + h
+        r = min(radius, w / 2, h / 2)
+
+        def j() -> float:
+            return rnd.uniform(-wobble, wobble)
+
+        tl_x, tl_y = x0 + r + j(), y0 + r + j()
+        tr_x, tr_y = x1 - r + j(), y0 + r + j()
+        br_x, br_y = x1 - r + j(), y1 - r + j()
+        bl_x, bl_y = x0 + r + j(), y1 - r + j()
+        path = QPainterPath()
+        path.moveTo(tl_x, tl_y)
+        path.quadTo((tl_x + tr_x) / 2 + j(), y0 + j(), tr_x, tr_y)
+        path.quadTo(x1 + j(), (tr_y + br_y) / 2 + j(), br_x, br_y)
+        path.quadTo((br_x + bl_x) / 2 + j(), y1 + j(), bl_x, bl_y)
+        path.quadTo(x0 + j(), (bl_y + tl_y) / 2 + j(), tl_x, tl_y)
+        path.closeSubpath()
+        return path
+
+    class BubbleCard(QWidget):
+        """Card rendered from the hand-drawn bubble image, drawn as a 9-slice
+        (border-image style): the drawn border and corners stay crisp while the
+        middle stretches, so any content fits inside the bubble shell."""
+        SLICE = 30
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self._bubble = QPixmap(str(bundle_root() / "assets" / "bubble.png"))
+
+        def paintEvent(self, _event: Any) -> None:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self._draw_bubble(p)
+            p.end()
+
+        def _draw_bubble(self, p: QPainter) -> None:
+            if self._bubble.isNull():
+                return
+            w, h = self.width(), self.height()
+            s = self.SLICE
+            sw_, sh_ = self._bubble.width(), self._bubble.height()
+            sx = [0, s, sw_ - s, sw_]
+            sy = [0, s, sh_ - s, sh_]
+            tx = [0, s, w - s, w]
+            ty = [0, s, h - s, h]
+            for iy in range(3):
+                for ix in range(3):
+                    src_w = sx[ix + 1] - sx[ix]
+                    src_h = sy[iy + 1] - sy[iy]
+                    dst_x = tx[ix]
+                    dst_y = ty[iy]
+                    dst_w = min(tx[ix + 1] - tx[ix], w - dst_x)
+                    dst_h = min(ty[iy + 1] - ty[iy], h - dst_y)
+                    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+                        continue
+                    p.drawPixmap(dst_x, dst_y, dst_w, dst_h,
+                                 self._bubble, sx[ix], sy[iy], src_w, src_h)
+
     class QuestionBubble(QWidget):
         """Standalone question bubble window.
 
@@ -301,27 +371,24 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 | Qt.WindowType.Window
             )
 
-            # The white rounded card.
-            self._card = QWidget(self)
-            self._card.setObjectName("qcard")
-            self._card.setStyleSheet(
-                "QWidget#qcard { background: #FFFFFF; border: 1px solid #D6DAE1;"
-                " border-radius: %dpx; }" % self.CORNER
-            )
+            # The hand-drawn card: rendered from the drawn bubble image.
+            self._card = BubbleCard()
+            self._card.setMinimumSize(322, 200)
             # Content control styles (labels, buttons, inputs, options).
             self.setStyleSheet(
                 "QLabel { color: #25282D; font-family: '幼圆','Microsoft YaHei UI'; }"
-                "QLabel.hint { color: #8A9099; font-size: 11px; }"
-                "QLabel.q { font-size: 14px; font-weight: 600; }"
+                "QLabel.hint { color: #6A7078; font-size: 11px; }"
+                "QLabel.q { font-size: 13px; font-weight: 600; }"
+                "QLabel.question { font-size: 13px; font-weight: 600; color: #2C333D; }"
                 "QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
                 " stop:0 #5B9BFF, stop:1 #3478F6); color: white; border: none;"
-                " border-radius: 12px; padding: 9px 18px;"
-                " font-family: '幼圆','Microsoft YaHei UI'; font-size: 13px; }"
+                " border-radius: 12px; padding: 8px 16px;"
+                " font-family: '幼圆','Microsoft YaHei UI'; font-size: 12px; }"
                 "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
                 " stop:0 #6FA8FF, stop:1 #3D84FF); }"
                 "QPushButton:disabled { background: #B8C4D6; }"
-                "QPushButton.ghost { background: #F1F3F6; color: #4A525E; }"
-                "QPushButton.ghost:hover { background: #E3E8EF; }"
+                "QPushButton.ghost { background: #FFFFFF; color: #4A525E; border: 1px solid #CBD3DE; }"
+                "QPushButton.ghost:hover { background: #EFF3F8; }"
                 "QLineEdit { border: 1px solid #CBD3DE; border-radius: 10px;"
                 " padding: 7px 12px; font-family: '幼圆','Microsoft YaHei UI';"
                 " font-size: 13px; background: #FAFBFC; selection-background-color: #3478F6; }"
@@ -329,11 +396,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 "QRadioButton, QCheckBox { color: #2C333D;"
                 " font-family: '幼圆','Microsoft YaHei UI'; font-size: 13px; spacing: 9px; }"
             )
-            shadow = QGraphicsDropShadowEffect(self._card)
-            shadow.setBlurRadius(26)
-            shadow.setOffset(0, 6)
-            shadow.setColor(QColor(20, 28, 40, 90))
-            self._card.setGraphicsEffect(shadow)
+            # No glow effect: the cel shadow is painted by BubbleCard itself.
 
             # Pre-rendered pointer tail triangle (drawn once into a QPixmap).
             # The triangle's top edge (the one meeting the card) is NOT stroked
@@ -355,9 +418,9 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                     path.closeSubpath()
                     # Fill pure white, stroke only the two slanted edges.
                     p.setPen(Qt.PenStyle.NoPen)
-                    p.setBrush(QColor("#FFFFFF"))
+                    p.setBrush(QColor("#FFFBF0"))
                     p.drawPath(path)
-                    p.setPen(QPen(QColor("#D6DAE1"), 1))
+                    p.setPen(QPen(QColor("#8A8F9A"), 1))
                     p.drawLine(1, 0, w_t / 2, h_t + 1)
                     p.drawLine(w_t - 1, 0, w_t / 2, h_t + 1)
                 else:  # tail points up, from card top edge
@@ -367,9 +430,9 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                     path.lineTo(w_t / 2, -h_t + 2)
                     path.closeSubpath()
                     p.setPen(Qt.PenStyle.NoPen)
-                    p.setBrush(QColor("#FFFFFF"))
+                    p.setBrush(QColor("#FFFBF0"))
                     p.drawPath(path)
-                    p.setPen(QPen(QColor("#D6DAE1"), 1))
+                    p.setPen(QPen(QColor("#8A8F9A"), 1))
                     p.drawLine(1, 2, w_t / 2, -h_t + 2)
                     p.drawLine(w_t - 1, 2, w_t / 2, -h_t + 2)
                 p.end()
@@ -386,8 +449,8 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
 
             # Content lives inside the card (away from the tail strip).
             self._layout = QVBoxLayout(self._card)
-            self._layout.setContentsMargins(16, 14, 16, 14)
-            self._layout.setSpacing(9)
+            self._layout.setContentsMargins(40, 56, 40, 36)
+            self._layout.setSpacing(12)
             self._apply_tail_side()
 
         def content_layout(self) -> QVBoxLayout:
@@ -412,6 +475,72 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.adjustSize()
             self.update()
 
+    class StatusCard(QWidget):
+        """Separate always-on-screen status/overlay card (balance, meme, state).
+
+        It lives in its own window so it is never clipped by the pet window,
+        which can extend off-screen while the pet is tucked at a screen corner.
+        """
+
+        CORNER = 18
+        SHADOW_MARGIN = 26
+
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.Tool
+                | Qt.WindowType.Window
+            )
+            # Cloud-styled card: reuse the same hand-drawn cloud background as
+            # the question bubble, so the status bubble matches the pet look.
+            self._card = BubbleCard()
+            self._card.setMinimumSize(300, 128)
+            lay = QVBoxLayout(self._card)
+            lay.setContentsMargins(40, 42, 40, 42)
+            lay.setSpacing(8)
+            self._title = QLabel("")
+            self._title.setObjectName("stitle")
+            self._title.setWordWrap(True)
+            self._title.setStyleSheet(
+                "QLabel#stitle { color: #2C333D; font-size: 14px; font-weight: 600;"
+                " font-family: '幼圆','Microsoft YaHei UI'; }"
+            )
+            self._detail = QLabel("")
+            self._detail.setObjectName("sdetail")
+            self._detail.setWordWrap(True)
+            self._detail.setStyleSheet(
+                "QLabel#sdetail { color: #5A6066; font-size: 12px;"
+                " font-family: '幼圆','Microsoft YaHei UI'; }"
+            )
+            lay.addWidget(self._title)
+            lay.addWidget(self._detail)
+            outer = QHBoxLayout(self)
+            outer.setContentsMargins(6, 6, 6, 6)
+            outer.addWidget(self._card)
+            self.adjustSize()
+            self.hide()
+
+        def show_card(self, title: str, detail: str, anchor_cx: int, anchor_top_y: int) -> None:
+            self._title.setText(title)
+            self._detail.setText(detail or title)
+            self.adjustSize()
+            b_w = self.width()
+            b_h = self.height()
+            geom = QApplication.screenAt(QPoint(anchor_cx, anchor_top_y))
+            geom = geom.availableGeometry() if geom is not None else QApplication.primaryScreen().availableGeometry()
+            x = int(anchor_cx - b_w / 2)
+            x = min(max(x, geom.left() + 4), max(geom.left() + 4, geom.right() - b_w - 4))
+            y = int(anchor_top_y - b_h)
+            if y < geom.top() + 4:
+                y = geom.top() + 4
+            y = min(y, max(geom.top() + 4, geom.bottom() - b_h - 4))
+            self.move(x, y)
+            self.show()
+            self.raise_()
+
     class CompanionWindow(QWidget):
         LABELS = {
             "IDLE": "休息中",
@@ -432,9 +561,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             super().__init__()
             self.layout_path = default_layout_path()
             self.layout = load_layout(self.layout_path)
+            self.use_separate_card = os.environ.get("DSH_DAFEIYU_USE_SEPARATE_CARD", "1") != "0"
             configured_scale = os.environ.get("DSH_DAFEIYU_SCALE")
             try:
-                self.scale = min(1.4, max(0.7, float(configured_scale))) if configured_scale else self.layout["scale"]
+                self.scale = min(1.4, max(0.5, float(configured_scale))) if configured_scale else self.layout["scale"]
             except ValueError:
                 self.scale = self.layout["scale"]
             configured_bubble_scale = os.environ.get("DSH_DAFEIYU_BUBBLE_SCALE")
@@ -507,6 +637,25 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.pet_x = 0
             self.pet_y = 0
             self.dragging = False
+            # Corner dock: when the pet sits at a bottom corner it slides down
+            # and toward the nearest side so only the head top (eyes + ahoge)
+            # peeks; hovering or clicking pops it back out.
+            self.setMouseTracking(True)
+            self._full_pet = (self.pet_x, self.pet_y)
+            self._docked = False
+            self._hover_pet = False
+            self._dock_anim: tuple[int, int, int, int, int, int] | None = None
+            self._auto_tuck_timer = QTimer(self)
+            self._auto_tuck_timer.setSingleShot(True)
+            self._auto_tuck_timer.setInterval(4000)
+            self._auto_tuck_timer.timeout.connect(self._on_auto_tuck)
+            # Hover debounce: only pop out after the mouse has rested over the
+            # peek for a moment, so a cursor jitter never re-triggers a bounce.
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.setInterval(150)
+            self._hover_timer.timeout.connect(self._on_hover_settle)
+            self.card = StatusCard()
             self.last_tick_ms = self._now_ms()
             self.fade_from_pixmap: QPixmap | None = None
             self.fade_started = 0.0
@@ -557,6 +706,8 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self._apply_config(message)
             elif kind == "question":
                 self._show_question_dialog(message)
+            elif kind == "question_close":
+                self._close_question()
             elif kind in {"state", "pulse"}:
                 state = str(message.get("state", "IDLE"))
                 self._track_task_activity(state)
@@ -594,6 +745,12 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                         state,
                         None if persistent else 4200,
                     )
+            # A non-WAITING state means the pending question was resolved
+            # elsewhere (the web page), so the desktop question notice must
+            # not stay up. The host's own QUESTION_CLOSE (if present) is a
+            # harmless no-op afterwards.
+            if kind == "state" and state != "WAITING" and self._question_bubble is not None:
+                self._close_question()
             self.update()
             if snapshot_path is not None and not self.snapshot_saved:
                 QTimer.singleShot(180, self._save_snapshot)
@@ -664,6 +821,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 y = int(bottom_y)
                 if y + b_h > geometry.bottom() - 4:
                     y = geometry.bottom() - b_h - 4
+            # Hard clamp so the dialog is NEVER off-screen, even when the pet is
+            # tucked into a corner edge.
+            x = min(max(x, geometry.left() + 4), max(geometry.left() + 4, geometry.right() - b_w - 4))
+            y = min(max(y, geometry.top() + 4), max(geometry.top() + 4, geometry.bottom() - b_h - 4))
             bubble.move(x, y)
 
         def _hide_question_bubble(self) -> None:
@@ -680,26 +841,75 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.update()
 
         def _show_question_dialog(self, message: dict[str, Any]) -> None:
-            """Start the serial desktop answer flow for a question batch.
+            """Show a compact question notice instead of the inline answer form.
 
-            Questions appear ONE at a time in a standalone bubble aimed at the
-            pet (single/multi/custom each on its own panel); answering advances
-            to the next question. When every question is answered the batch is
-            emitted once as question_answer. The browser escape hatch skips the
-            whole batch (question_skip) and raises the DSH web page.
+            The pet no longer collects answers in the bubble; it only signals
+            that a question is waiting and brings the DSH web page forward on
+            demand. The single "去网页作答" action abandons the desktop side
+            (question_skip, leaving the browser provider live) and raises the
+            browser, where the real question UI answers it.
             """
             questions = message.get("questions")
             if not isinstance(questions, list) or len(questions) == 0:
                 return
             if self._question_bubble is not None:
-                return  # A batch is already being answered.
-            self._question_queue = [q for q in questions if isinstance(q, dict)]
+                return  # A notice is already showing.
+            self._question_queue = []
             self._question_answers = []
             self._question_meta = {
                 "sessionId": str(message.get("sessionId", "")),
                 "callId": str(message.get("callId", "")),
             }
-            self._question_next()
+            self.model.apply_state("WAITING")
+
+            count = len(questions)
+            first = questions[0] if isinstance(questions[0], dict) else {}
+            first_text = str(first.get("question", ""))
+            if len(first_text) > 90:
+                first_text = first_text[:90] + "…"
+
+            def build_content(layout, parent):
+                title = QLabel("有新提问待你作答")
+                title.setProperty("class", "q")
+                title.setWordWrap(True)
+                layout.addWidget(title)
+                if first_text and count <= 1:
+                    brief = QLabel(first_text)
+                    brief.setProperty("class", "question")
+                    brief.setWordWrap(True)
+                    layout.addWidget(brief)
+                sub = QLabel("点击右下方按钮 → 到网页作答" if count <= 1
+                             else f"共 {count} 个问题 · 点击右下方按钮 → 到网页作答")
+                sub.setProperty("class", "hint")
+                sub.setWordWrap(True)
+                layout.addWidget(sub)
+
+                footer = QHBoxLayout()
+                cancel = QPushButton("关闭")
+                cancel.setProperty("class", "ghost")
+                cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+                cancel.clicked.connect(lambda: self._close_question())
+                footer.addWidget(cancel)
+                footer.addStretch(1)
+                go = QPushButton("去网页作答")
+                go.setProperty("class", "ghost")
+                go.setCursor(Qt.CursorShape.PointingHandCursor)
+                go.clicked.connect(lambda: self._question_skip_to_browser())
+                footer.addWidget(go)
+                layout.addLayout(footer)
+
+            self._question_bubble = self._show_question_bubble(build_content)
+            if question_snapshot_path is not None:
+                QTimer.singleShot(160, lambda: self._grab_question_snapshot())
+
+        def _grab_question_snapshot(self) -> None:
+            if self._question_bubble is None or question_snapshot_path is None:
+                return
+            try:
+                question_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                self._question_bubble.grab().save(str(question_snapshot_path), "PNG")
+            except Exception:
+                pass
 
         def _question_next(self) -> None:
             """Show the next queued question, or emit the collected batch."""
@@ -820,7 +1030,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             found = []
 
             def title_mentions_harness(text: str) -> bool:
-                return "DeepSeek Harness" in text or "127.0.0.1:3080" in text
+                low = text.lower()
+                # The running page title is "<session> — DSH 本地构建 …", so the
+                # brand appears as "DSH" (not "DeepSeek Harness"); match that too.
+                return "deepseek harness" in low or "127.0.0.1:3080" in text or "dsh" in low
 
             def is_browser(pid: int) -> bool:
                 handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
@@ -847,13 +1060,14 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                     return True
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
-                title = buf.value
-                if not title_mentions_harness(title):
-                    return True
-                pid = wintypes.DWORD()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if is_browser(pid.value):
-                    found.append(hwnd)
+                # Match the DSH page by title, but only for real browser windows:
+                # "DSH" also appears in the pet's own window ("DSH 大肥鱼"), and a
+                # title-only match would raise the fish instead of the browser.
+                if title_mentions_harness(buf.value):
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if is_browser(pid.value):
+                        found.append(hwnd)
                 return True
 
             user32.EnumWindows(EnumWindowsProc(cb), 0)
@@ -894,6 +1108,20 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 except Exception:
                     pass
 
+        def _close_question(self) -> None:
+            """Abandon the current desktop question batch without answering.
+
+            The question was resolved elsewhere (the web page, or this plugin's
+            own answer already recorded by the host), so the pet's bubble must
+            not stay open. Unlike _question_skip_to_browser, no question_answer
+            / question_skip reply is emitted — the host already settled it.
+            """
+            self._question_answers = []
+            self._question_queue = []
+            self._question_meta = {}
+            self._hide_question_bubble()
+            self.model.apply_state(self.display_state or "IDLE")
+
         def _track_task_activity(self, state: str) -> None:
             """Update the task-active flag on state transitions.
 
@@ -925,6 +1153,9 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             reduced_motion = message.get("reducedMotion")
             if isinstance(reduced_motion, bool) and reduced_motion != self.reduced_motion:
                 self._set_reduced_motion(reduced_motion)
+            use_separate = message.get("useSeparateCard")
+            if isinstance(use_separate, bool):
+                self.use_separate_card = use_separate
             activity_level = message.get("activityLevel")
             if activity_level in {"quiet", "normal", "lively"}:
                 self.activity_level = activity_level
@@ -959,6 +1190,8 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self.display_state = self.model.base_state
             if self.overlay_deadline_ms is not None and now_ms >= self.overlay_deadline_ms:
                 self._clear_overlay()
+            self._maybe_update_dock()
+            self._sync_card()
             self.update()
 
         def _play_idle_micro(self) -> None:
@@ -1043,8 +1276,107 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self._question_bubble.update()
             self.update()
 
+        def _pet_screen_rect(self) -> tuple[int, int, int, int]:
+            pet_w, pet_h = self._pet_size()
+            # pet_y is the pet's screen TOP; the pet extends down pet_h.
+            return self.pet_x, self.pet_y, self.pet_x + pet_w, self.pet_y + pet_h
+
+        def _near_screen_corner(self) -> bool:
+            geom = self._screen_geometry_at(self.pet_x, self.pet_y)
+            if geom is None:
+                return False
+            left, top, right, bottom = self._pet_screen_rect()
+            margin = 90
+            at_bottom = bottom >= geom.bottom() - margin
+            at_left = left <= geom.left() + margin
+            at_right = right >= geom.right() - margin
+            return at_bottom and (at_left or at_right)
+
+        def _corner_dock_target(self) -> tuple[int, int]:
+            geom = self._screen_geometry_at(self.pet_x, self.pet_y)
+            if geom is None:
+                return self.pet_x, self.pet_y
+            pet_w, pet_h = self._pet_size()
+            # Bottom-corner dock only: slide STRAIGHT DOWN so the head top
+            # (eyes + ahoge) peeks above the bottom edge and the body hides
+            # below, keeping the pet's horizontal position so no side is cut.
+            visible = max(1, round(pet_h * 0.42))
+            dock_y = geom.bottom() - visible
+            # Never cut the pet on a side: clamp the docked x so the whole pet
+            # stays on-screen horizontally.
+            dock_x = min(max(self.pet_x, geom.left()), geom.right() - pet_w)
+            return int(dock_x), int(dock_y)
+
+        def _pop_out(self, duration_ms: int = 260) -> None:
+            fx, fy = self.pet_x, self.pet_y
+            tx, ty = self._full_pet
+            self._dock_anim = (fx, fy, tx, ty, self._now_ms(), duration_ms)
+            self._auto_tuck_timer.start()
+
+        def _on_hover_settle(self):
+            # The mouse has rested over the peek long enough: pop out.
+            if self._hover_pet and self._docked:
+                self._pop_out()
+
+        def _on_auto_tuck(self):
+            if self._hover_pet:
+                self._auto_tuck_timer.start()
+                return
+            self._maybe_update_dock()
+
+        def leaveEvent(self, event: Any) -> None:
+            self._hover_pet = False
+            self._hover_timer.stop()
+            super().leaveEvent(event)
+            self._maybe_update_dock()
+
+        def _maybe_update_dock(self) -> None:
+            if self.dragging or self._question_bubble is not None:
+                self._auto_tuck_timer.stop()
+                return
+            anim = self._dock_anim
+            if anim is not None:
+                fx, fy, tx, ty, start_ms, dur = anim
+                t = min(1.0, max(0.0, (self._now_ms() - start_ms) / dur))
+                ease = t * t * (3 - 2 * t)
+                self._place_pet(round(fx + (tx - fx) * ease), round(fy + (ty - fy) * ease))
+                if t >= 1.0:
+                    self._dock_anim = None
+                    self._docked = (self.pet_x, self.pet_y) != self._full_pet
+                return
+            if self._near_screen_corner() and not self._docked and not self._hover_pet:
+                self._full_pet = (self.pet_x, self.pet_y)
+                fx, fy = self.pet_x, self.pet_y
+                tx, ty = self._corner_dock_target()
+                self._dock_anim = (fx, fy, tx, ty, self._now_ms(), 340)
+                self._auto_tuck_timer.stop()
+            elif (not self._near_screen_corner()) and self._docked:
+                self._pop_out()
+            elif not self._docked and self._near_screen_corner():
+                self._auto_tuck_timer.start()
+            else:
+                self._auto_tuck_timer.stop()
+
         def _pet_offset_x(self, pet_width: int) -> int:
             return min(max(self.pet_x - self.x(), 0), self.width() - pet_width)
+
+        def _place_pet(self, pet_x: int, pet_y: int) -> None:
+            """Position the window so the pet is at (pet_x, pet_y) WITHOUT the
+            screen clamp. Used only for the corner dock, where the pet has to
+            slide mostly below the screen to peek its head top.
+            """
+            pet_w, pet_h = self._pet_size()
+            self.pet_x = pet_x
+            self.pet_y = pet_y
+            self.move(
+                pet_x - (self.width() - pet_w) // 2,
+                pet_y - (self.height() - pet_h - 8),
+            )
+            if self._question_bubble is not None:
+                side = self._question_side()
+                self._position_question_bubble(self._question_bubble, side)
+                self._question_bubble.update()
+            self.update()
 
         @staticmethod
         def _title_font_pt(s: float) -> float:
@@ -1097,7 +1429,19 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             if max_x < min_x:
                 max_x = min_x
             card_x = min(max(card_x, min_x), max_x)
-            return card_x, 7, card_width, card_height
+            # Hard clamp the card to the SCREEN (not just the window): a docked
+            # pet can place the window partly off-screen, so clamp by screen
+            # coordinates to keep the whole card visible.
+            card_y = 7
+            geom = self._screen_geometry_at(self.pet_x, self.pet_y)
+            if geom is not None:
+                screen_x = self.x() + card_x
+                screen_y = self.y() + card_y
+                screen_x = min(max(screen_x, geom.left() + 6), max(geom.left() + 6, geom.right() - card_width - 6))
+                screen_y = min(max(screen_y, geom.top() + 6), max(geom.top() + 6, geom.bottom() - card_height - 6))
+                card_x = int(screen_x - self.x())
+                card_y = int(screen_y - self.y())
+            return card_x, card_y, card_width, card_height
 
         def _restore_visible_position(self) -> None:
             pet_width, pet_height = self._pet_size()
@@ -1194,6 +1538,20 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 "DISCONNECTED": (QColor("#ECEEF1"), QColor("#7B818A")),
             }.get(state, (QColor("#ECEEF1"), QColor("#747A84")))
 
+        def _sync_card(self) -> None:
+            if not self.use_separate_card:
+                # Rollback mode: the in-window hand-drawn card paints in the pet
+                # window, so the separate StatusCard stays hidden.
+                self.card.hide()
+                return
+            card = self._current_card()
+            if card:
+                title, detail, state = card
+                pet_w, _ = self._pet_size()
+                self.card.show_card(title, detail, self.pet_x + pet_w // 2, self.pet_y)
+            else:
+                self.card.hide()
+
         def _draw_status_icon(self, painter: QPainter, state: str, center_x: int, center_y: int) -> None:
             background, foreground = self._status_colors(state)
             radius = 23
@@ -1230,7 +1588,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             # 平滑缩放：放大/缩小时插值，避免锯齿和模糊
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            card = self._current_card()
+            card = self._current_card() if not self.use_separate_card else None
             bubble_height = 12
             if card:
                 title, detail, card_state = card
@@ -1381,6 +1739,16 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self.dragging = False
 
         def mouseMoveEvent(self, event: QMouseEvent) -> None:
+            gpos = event.globalPosition().toPoint()
+            px, py, pw, ph = self._pet_rect()
+            self._hover_pet = (
+                self.x() + px <= gpos.x() <= self.x() + px + pw
+                and self.y() + py <= gpos.y() <= self.y() + py + ph
+            )
+            if self._hover_pet and self._docked and self._dock_anim is None:
+                self._hover_timer.start()
+            elif not self._hover_pet:
+                self._hover_timer.stop()
             if self.drag_origin is not None and self.pet_origin is not None:
                 if not self.dragging and (event.globalPosition().toPoint() - self.drag_origin).manhattanLength() > 5:
                     self.dragging = True
@@ -1393,9 +1761,16 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 if self.dragging:
                     self.model.clear_overlay()
                     self._move_to_pet(self.pet_x, self.pet_y)
+                    self._full_pet = (self.pet_x, self.pet_y)
+                    self._docked = False
+                    self._dock_anim = None
                     self._save_layout()
                 else:
-                    self._play_click_interaction(event.position().x(), event.position().y())
+                    if self._docked or self._dock_anim is not None:
+                        # Clicking a docked (peeking) pet pops it back out.
+                        self._pop_out()
+                    else:
+                        self._play_click_interaction(event.position().x(), event.position().y())
             self.drag_origin = None
             self.pet_origin = None
             self.dragging = False
@@ -1550,7 +1925,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             menu = QMenu(self)
             size_menu = menu.addMenu("大小")
             size_actions = {}
-            for label, scale in (("小", 0.8), ("标准", 1.0), ("大", 1.25)):
+            for label, scale in (("小", 0.55), ("标准", 1.0), ("大", 1.25)):
                 action = size_menu.addAction(label)
                 action.setCheckable(True)
                 action.setChecked(abs(self.scale - scale) < 0.05)
@@ -1574,11 +1949,13 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 self._apply_window_size()
                 self._move_to_pet(self.pet_x, self.pet_y)
                 self._save_layout()
+                emit_reply("settings_config", scale=self.scale, bubbleScale=self.bubble_scale)
             elif selected in bubble_size_actions:
                 self.bubble_scale = bubble_size_actions[selected]
                 self._apply_window_size()
                 self._move_to_pet(self.pet_x, self.pet_y)
                 self._save_layout()
+                emit_reply("settings_config", scale=self.scale, bubbleScale=self.bubble_scale)
             elif selected == reduced_action:
                 self._set_reduced_motion(reduced_action.isChecked())
                 self._save_layout()
@@ -1627,9 +2004,10 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true", help="validate the protocol without opening a window")
     parser.add_argument("--event-log", type=Path, help="append received protocol messages to a JSONL file")
     parser.add_argument("--snapshot", type=Path, help="save one diagnostic visual frame after the first message")
+    parser.add_argument("--question-snapshot", type=Path, help="save the rendered question bubble to a PNG right after it is shown")
     args = parser.parse_args()
     recorder = EventRecorder(args.event_log)
-    return run_headless(recorder) if args.headless else run_visual(recorder, args.snapshot)
+    return run_headless(recorder) if args.headless else run_visual(recorder, args.snapshot, args.question_snapshot)
 
 
 if __name__ == "__main__":

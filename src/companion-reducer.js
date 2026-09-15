@@ -209,18 +209,19 @@ export class CompanionReducer {
   #toolResult(record, event) {
     const callId = toolCallIdOf(event)
     if (callId) record.openTools.delete(callId)
-    if (callId && callId === record.waitingCallId) record.waitingCallId = undefined
-    return this.#resumeAfterTool(record, event)
+    const closeQuestion = Boolean(callId && callId === record.waitingCallId)
+    if (closeQuestion) record.waitingCallId = undefined
+    return this.#resumeAfterTool(record, event, closeQuestion)
   }
 
   #userMessage(record, event) {
     if (!record.waitingCallId) return []
     record.openTools.delete(record.waitingCallId)
     record.waitingCallId = undefined
-    return this.#resumeAfterTool(record, event)
+    return this.#resumeAfterTool(record, event, true)
   }
 
-  #resumeAfterTool(record, event) {
+  #resumeAfterTool(record, event, closeQuestion = false) {
     if (record.waitingCallId && record.openTools.has(record.waitingCallId)) {
       return this.#render()
     }
@@ -238,7 +239,10 @@ export class CompanionReducer {
         : statusCopy('result', event.seq),
     }
     this.#update(record, next, nextPayload)
-    if (!event.data?.error) return this.#render()
+    if (!event.data?.error) {
+      const messages = this.#render()
+      return closeQuestion ? [...messages, this.#closeQuestionMessage(record)] : messages
+    }
 
     const selection = this.#select()
     if (selection.record.state === CompanionState.WAITING || selection.record.state === CompanionState.ERROR) {
@@ -257,7 +261,14 @@ export class CompanionReducer {
       message: statusCopy('toolError', event.seq),
       detail: detailFor(record),
       errorCode: event.data.error.code,
-    })]
+    }), ...(closeQuestion ? [this.#closeQuestionMessage(record)] : [])]
+  }
+
+  #closeQuestionMessage(record) {
+    return createMessage(CompanionMessageKind.QUESTION_CLOSE, {
+      sessionId: record.id,
+      outcome: 'resolved',
+    })
   }
 
   #todo(record, event) {

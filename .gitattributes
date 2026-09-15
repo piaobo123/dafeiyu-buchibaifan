@@ -1,0 +1,14 @@
+# Keep every text file stored and checked out as LF.
+#
+# The repository had a mix of CRLF and LF blobs (helper.py and src/*.js were
+# CRLF, package.json was LF), and the local working copy is pure LF, so any
+# normal edit produced a whole-file line-ending diff on top of the real change.
+# This pins the convention to LF for everyone, whatever core.autocrlf is set to
+# on a given machine.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.exe binary
+*.ico binary
+*.tgz binary

@@ -180,6 +180,11 @@ export class HelperProcess {
         this.options.onQuestionReply?.(reply)
         return
       }
+      // Helper -> host size pick: the menu's scale/bubbleScale persists via the host.
+      if (reply?.protocolVersion === 1 && reply.kind === 'settings_config') {
+        this.options.onSettingsConfig?.(reply)
+        return
+      }
     } catch {
       // Non-protocol stdout is still useful in development logs.
     }

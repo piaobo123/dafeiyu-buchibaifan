@@ -12,7 +12,7 @@ export const inject = ['sessions']
 export const CONFIG_ENDPOINT = '/plugins/dafeiyu-buchibaifan/config'
 export const Config = Schema.object({
   enabled: Schema.boolean().default(true).description('启用桌面大肥鱼'),
-  scale: Schema.number().min(0.7).max(1.4).step(0.05).default(1).role('slider').description('角色大小'),
+  scale: Schema.number().min(0.5).max(1.4).step(0.05).default(1).role('slider').description('角色大小'),
   bubbleScale: Schema.number().min(0.8).max(1.2).step(0.05).default(1).role('slider').description('气泡大小'),
   activityLevel: Schema.union([
     Schema.const('quiet').description('安静'),
@@ -21,6 +21,7 @@ export const Config = Schema.object({
   ]).default('normal').description('空闲微动作频率'),
   reducedMotion: Schema.boolean().default(false).description('减少走动、循环帧和程序化晃动'),
   includeSubagents: Schema.boolean().default(false).description('允许子 Agent 抢占宠物状态'),
+  useSeparateCard: Schema.boolean().default(true).role('switch').description('状态/余额卡片用独立悬浮窗口（始终在屏幕内；关闭则用回旧的窗口内手绘卡片）'),
 }).description('由 DeepSeek Harness 状态驱动的桌面大肥鱼伴侣')
 
 const defaults = Object.freeze({
@@ -30,6 +31,7 @@ const defaults = Object.freeze({
   activityLevel: 'normal',
   reducedMotion: false,
   includeSubagents: false,
+  useSeparateCard: true,
 })
 
 function publicConfig(config = {}) {
@@ -40,6 +42,7 @@ function publicConfig(config = {}) {
     activityLevel: config.activityLevel ?? defaults.activityLevel,
     reducedMotion: config.reducedMotion ?? defaults.reducedMotion,
     includeSubagents: config.includeSubagents ?? defaults.includeSubagents,
+    useSeparateCard: config.useSeparateCard ?? defaults.useSeparateCard,
   }
 }
 
@@ -134,6 +137,36 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     void startRuntime(next)
   }
 
+  // The credentials service is mounted by the base bundle after this plugin
+  // (which injects on 'settings') starts, so the first resolveApiKey() can
+  // legitimately come up empty on a fresh host boot. Retry briefly: as soon
+  // as the key resolves, respawn the helper so the balance lookup self-heals
+  // without a manual disable/enable.
+  let apiKeyRetryTimer
+  const scheduleApiKeyRetry = () => {
+    if (apiKeyRetryTimer) return
+    let attempt = 0
+    const tryResolve = async () => {
+      attempt += 1
+      let key
+      try { key = await resolveApiKey() } catch { key = undefined }
+      if (key !== undefined) {
+        apiKeyRetryTimer = undefined
+        logger.info?.('dsh-dafeiyu: DeepSeek API key resolved after startup; restarting helper')
+        restartRuntime(settings.get())
+        return
+      }
+      if (attempt < 6) {
+        apiKeyRetryTimer = setTimeout(tryResolve, 4000)
+        apiKeyRetryTimer.unref?.()
+      } else {
+        apiKeyRetryTimer = undefined
+      }
+    }
+    apiKeyRetryTimer = setTimeout(tryResolve, 4000)
+    apiKeyRetryTimer.unref?.()
+  }
+
   const applyLiveSettings = (next) => {
     for (const message of reducer.setIncludeSubagents(next.includeSubagents === true)) bridge.send(message)
     bridge.send(createMessage(CompanionMessageKind.CONFIG, {
@@ -141,6 +174,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       bubbleScale: next.bubbleScale ?? defaults.bubbleScale,
       activityLevel: next.activityLevel ?? defaults.activityLevel,
       reducedMotion: next.reducedMotion === true,
+      useSeparateCard: next.useSeparateCard !== false,
     }))
   }
 
@@ -196,6 +230,33 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     }
   }
 
+  // DSH 0.1.2 web gates every /api request behind a signed browser-session
+  // cookie (the `/api` route answers 401 without it). The plugin is a host
+  // plugin, so it can reuse the connection service's launch-token exchange to
+  // mint that cookie in-process instead of guessing: `authenticatedUrl()` adds
+  // the launch token, and fetching it with `redirect: 'manual'` returns the
+  // 303 whose Set-Cookie is the session cookie the fence will accept. The
+  // cookie is cached because the user-questions provider stays live across
+  // questions; a 401 clears it so the next answer re-mints a fresh one.
+  let webSessionCookie
+  const getWebSessionCookie = async () => {
+    if (webSessionCookie !== undefined) return webSessionCookie
+    try {
+      const connection = ctx.get('connection', false)
+      if (!connection?.authenticatedUrl) return undefined
+      const response = await fetch(connection.authenticatedUrl(baseUrlOf()), { redirect: 'manual' })
+      const setCookie = response.headers.get('set-cookie')
+      if (!setCookie) return undefined
+      // Keep only the name=value pair; the trailing attributes are for the
+      // browser and would be sent back verbatim, which no Cookie parser wants.
+      webSessionCookie = setCookie.split(';')[0].trim()
+      return webSessionCookie
+    } catch (error) {
+      logger.warn?.(`dsh-dafeiyu web auth cookie fetch failed: ${error.message}`)
+      return undefined
+    }
+  }
+
   const startMux = async () => {
     stopMux()
     try {
@@ -219,6 +280,23 @@ function mount(ctx, config = {}, eventCtx = ctx) {
               rpcId: frame.rpcId,
               questions: frame.payload.questions ?? [],
             })
+          } else if (frame?.payload?.type === 'question/resolved') {
+            // The question was answered (or cancelled) somewhere else — the
+            // browser, another desktop tab, or this very plugin's own answer.
+            // In every case the pet bubble must not stay open, so tell the
+            // helper to tear it down. Frame's questionRpcId is the same rpcId
+            // the /api/respond POST echoes, so match by that too.
+            const sessionId = String(frame.payload.sessionId ?? '')
+            const questionRpcId = String(frame.payload.questionRpcId ?? '')
+            const pending = pendingQuestionsBySession.get(sessionId)
+            if (pending !== undefined && (questionRpcId === '' || String(pending.rpcId) === questionRpcId)) {
+              bridge?.send(createMessage(CompanionMessageKind.QUESTION_CLOSE, {
+                sessionId,
+                questionRpcId,
+                outcome: frame.payload.outcome,
+              }))
+              pendingQuestionsBySession.delete(sessionId)
+            }
           }
         } catch {
           // Non-JSON frames are ignored.
@@ -258,8 +336,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
 
   const handleQuestionReply = async (reply) => {
     const { sessionId, callId, answer, skip } = reply
-    if (skip === true) {
-      if (sessionId !== undefined) pendingQuestionsBySession.delete(String(sessionId))
+    if (skip === true) {      if (sessionId !== undefined) pendingQuestionsBySession.delete(String(sessionId))
       return
     }
     const pending = sessionId !== undefined ? pendingQuestionsBySession.get(String(sessionId)) : undefined
@@ -274,18 +351,26 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       ...(a.custom !== undefined ? { custom: String(a.custom) } : {}),
     }))
     try {
-      const response = await fetch(`${baseUrlOf()}/api/respond`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          type: 'client-response',
-          rpcId: pending.rpcId,
-          result: {
-            ok: true,
-            value: { sessionId: sessionIdStr, answer: { answers } },
-          },
-        }),
+      const body = JSON.stringify({
+        type: 'client-response',
+        rpcId: pending.rpcId,
+        result: {
+          ok: true,
+          value: { sessionId: sessionIdStr, answer: { answers } },
+        },
       })
+      const post = async (cookie) => {
+        const headers = { 'content-type': 'application/json' }
+        if (cookie !== undefined) headers.cookie = cookie
+        return fetch(`${baseUrlOf()}/api/respond`, { method: 'POST', headers, body })
+      }
+      let response = await post(await getWebSessionCookie())
+      if (response.status === 401) {
+        // The cached cookie may be stale (host restarted, token rotated):
+        // discard it and mint one fresh cookie on this same answer.
+        webSessionCookie = undefined
+        response = await post(await getWebSessionCookie())
+      }
       if (response.ok) {
         pendingQuestionsBySession.delete(sessionIdStr)
         logger.info?.('dsh-dafeiyu answered question', { sessionId: sessionIdStr, callId })
@@ -297,6 +382,21 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     }
   }
 
+  // The helper's right-click size menu persists its choice through this host
+  // round-trip: write scale/bubbleScale back to the plugin settings so the
+  // size survives a restart.
+  const handleSettingsConfig = (reply) => {
+    const patch = {}
+    if (typeof reply.scale === 'number') patch.scale = reply.scale
+    if (typeof reply.bubbleScale === 'number') patch.bubbleScale = reply.bubbleScale
+    if (Object.keys(patch).length === 0) return
+    void settings.update(patch).then(() => {
+      logger.info?.('dsh-dafeiyu persisted size change', patch)
+    }).catch((error) => {
+      logger.warn?.(`dsh-dafeiyu size persist failed: ${error.message}`)
+    })
+  }
+
   const startRuntime = async (resolved) => {
     if (resolved.enabled === false) {
       logger.info?.('dsh-dafeiyu is disabled')
@@ -304,6 +404,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     }
     const helperConfig = config.helper ?? {}
     const apiKey = await resolveApiKey()
+    if (apiKey === undefined) scheduleApiKeyRetry()
     bridge = new HelperProcess({
       ...helperConfig,
       env: {
@@ -312,12 +413,14 @@ function mount(ctx, config = {}, eventCtx = ctx) {
         DSH_DAFEIYU_BUBBLE_SCALE: String(resolved.bubbleScale ?? defaults.bubbleScale),
         DSH_DAFEIYU_ACTIVITY_LEVEL: String(resolved.activityLevel ?? defaults.activityLevel),
         DSH_DAFEIYU_REDUCED_MOTION: resolved.reducedMotion === true ? '1' : '0',
+        DSH_DAFEIYU_USE_SEPARATE_CARD: resolved.useSeparateCard === false ? '0' : '1',
         ...(apiKey === undefined ? {} : { DSH_DAFEIYU_API_KEY: apiKey }),
         // Explicitly hand the web URL to the helper so its "open in browser"
         // escape hatch can raise/activate the DSH page.
         DSH_WEB_URL: baseUrlOf(),
       },
       onQuestionReply: handleQuestionReply,
+      onSettingsConfig: handleSettingsConfig,
     }, logger)
     reducer = new CompanionReducer({ includeSubagents: resolved.includeSubagents === true })
     bridge.start()
@@ -393,6 +496,8 @@ function mount(ctx, config = {}, eventCtx = ctx) {
   ctx.effect(() => () => {
     if (restartTimer) clearTimeout(restartTimer)
     restartTimer = undefined
+    if (apiKeyRetryTimer) clearTimeout(apiKeyRetryTimer)
+    apiKeyRetryTimer = undefined
     offEvent?.()
     offDisposed?.()
     unwatch()

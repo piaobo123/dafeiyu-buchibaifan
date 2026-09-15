@@ -20,6 +20,7 @@ export const CompanionMessageKind = Object.freeze({
   QUESTION: 'question',
   QUESTION_ANSWER: 'question_answer',
   QUESTION_SKIP: 'question_skip',
+  QUESTION_CLOSE: 'question_close',
   PING: 'ping',
   PONG: 'pong',
   CLOSED: 'closed',
