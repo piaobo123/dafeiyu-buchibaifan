@@ -55,6 +55,7 @@
     "test:helper": "node --test test/helper-lifecycle.test.js",
     "test:python": "py -3 -m unittest discover -s runtime/tests -t .",
     "test:ui": "node test/fixtures/ui-acceptance.js",
+    "test:scheduler": "py -3 scripts/test-action-scheduler.py",
     "helper:headless": "py -3 runtime/helper.py --headless",
     "helper:visual": "py -3 runtime/helper.py",
     "build:helper:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-helper.ps1",

@@ -21,10 +21,10 @@ from pathlib import Path
 from typing import Any, TextIO
 
 try:
-    from .animation_model import AnimationModel
+    from .animation_model import ActionScheduler, AnimationModel
     from .layout_store import default_layout_path, load_layout, save_layout
 except ImportError:
-    from animation_model import AnimationModel
+    from animation_model import ActionScheduler, AnimationModel
     from layout_store import default_layout_path, load_layout, save_layout
 
 
@@ -46,6 +46,28 @@ def configure_stdio() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
             reconfigure(encoding="utf-8", errors=errors)
+
+
+def money_bar_max(cap: float) -> float:
+    """Progress-bar denominator: round the cap up to whole thousands, min 1000."""
+    try:
+        value = float(cap)
+    except (TypeError, ValueError):
+        value = 1000.0
+    if value <= 0:
+        value = 1000.0
+    maximum = 1000.0
+    while value > maximum:
+        maximum *= 10.0
+    return maximum
+def env_int(name: str, fallback: int) -> int:
+    """Read a non-negative integer environment override."""
+    raw = os.environ.get(name, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return fallback
+    return max(0, value)
 
 
 def parse_message(line: str) -> dict[str, Any]:
@@ -574,6 +596,145 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             self.show()
             self.raise_()
 
+    class StatsBar(QWidget):
+        """Always-on-screen strip under the pet: today / month / balance (CNY).
+
+        It is its own window (like StatusCard) so the pet window geometry,
+        hit-testing and corner docking keep working unchanged.
+        """
+
+        MIN_WIDTH = 320
+        MAX_WIDTH = 460
+        HEIGHT = 48
+
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.Tool
+                | Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            self._payload: dict[str, Any] = {}
+            self._anchor: tuple[int, int] | None = None
+            self._shown = False
+            self.setFixedSize(self.MIN_WIDTH, self.HEIGHT)
+            self.hide()
+
+        def set_payload(self, payload: dict[str, Any] | None) -> None:
+            next_payload = dict(payload or {})
+            if next_payload == self._payload:
+                return
+            self._payload = next_payload
+            self.update()
+
+        def sync(self, anchor_cx: int, anchor_y: int, above: bool, width: int) -> None:
+            width = max(self.MIN_WIDTH, min(self.MAX_WIDTH, int(width)))
+            if width != self.width():
+                self.setFixedSize(width, self.HEIGHT)
+            screen = QApplication.screenAt(QPoint(int(anchor_cx), int(anchor_y)))
+            geom = screen.availableGeometry() if screen is not None else None
+            x = int(anchor_cx - width / 2)
+            y = int(anchor_y - self.HEIGHT) if above else int(anchor_y)
+            if geom is not None:
+                x = min(max(x, geom.left() + 6), max(geom.left() + 6, geom.right() - width - 6))
+                y = min(max(y, geom.top() + 6), max(geom.top() + 6, geom.bottom() - self.HEIGHT - 6))
+            if self._anchor != (x, y):
+                self._anchor = (x, y)
+                self.move(x, y)
+            if not self._shown:
+                self.show()
+                self.raise_()
+                self._shown = True
+
+        def conceal(self) -> None:
+            if self._shown:
+                self._shown = False
+                self.hide()
+
+        @staticmethod
+        def _money(value: Any) -> str:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return "--"
+            if abs(value) >= 100:
+                return f"¥{value:.1f}"
+            return f"¥{value:.2f}"
+
+        @staticmethod
+        def _ratio(balance: Any, cap: Any) -> float:
+            if not isinstance(balance, (int, float)) or isinstance(balance, bool):
+                return 0.0
+            if not isinstance(cap, (int, float)) or isinstance(cap, bool) or cap <= 0:
+                return 0.0
+            return max(0.0, min(1.0, float(balance) / float(cap)))
+
+        @staticmethod
+        def _balance_color(ratio: float) -> QColor:
+            if ratio <= 0.2:
+                return QColor("#E5484D")
+            if ratio <= 0.45:
+                return QColor("#D88A00")
+            return QColor("#1E9E5A")
+
+        def paintEvent(self, _event: Any) -> None:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            width = self.width()
+            height = self.height()
+            radius = 14
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(17, 24, 39, 18))
+            painter.drawRoundedRect(1, 3, width - 2, height - 4, radius, radius)
+            painter.setPen(QPen(QColor(218, 221, 226, 220), 1))
+            painter.setBrush(QColor(252, 252, 253, 250))
+            painter.drawRoundedRect(0, 0, width - 1, height - 4, radius, radius)
+
+            today = self._payload.get("todayCny")
+            month = self._payload.get("monthCny")
+            balance = self._payload.get("balanceCny")
+            cap = self._payload.get("balanceBarMaxCny") or self._payload.get("balanceCapCny")
+            ratio = self._ratio(balance, cap)
+
+            font = QFont("幼圆")
+            font.setFamilies(["幼圆", "Microsoft YaHei UI"])
+            font.setPointSizeF(9.0)
+            bold = QFont(font)
+            bold.setWeight(QFont.Weight.DemiBold)
+
+            column = (width - 24) / 3
+            entries = (
+                ("今日", self._money(today), QColor("#25282D")),
+                ("本月", self._money(month), QColor("#25282D")),
+                ("余额", self._money(balance), self._balance_color(ratio)),
+            )
+            painter.setFont(font)
+            for index, (label, value, color) in enumerate(entries):
+                left = 12 + column * index
+                painter.setPen(QColor("#747981"))
+                painter.drawText(
+                    int(left), 0, 30, 28,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label,
+                )
+                painter.setPen(color)
+                painter.setFont(bold)
+                painter.drawText(
+                    int(left) + 28, 0, int(column) - 28, 28,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, value,
+                )
+                painter.setFont(font)
+
+            track_x = 12
+            track_w = width - 24
+            track_y = height - 15
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#ECEEF1"))
+            painter.drawRoundedRect(track_x, track_y, track_w, 5, 2.5, 2.5)
+            if ratio > 0:
+                painter.setBrush(self._balance_color(ratio))
+                painter.drawRoundedRect(track_x, track_y, max(4, int(track_w * ratio)), 5, 2.5, 2.5)
+
     class CompanionWindow(QWidget):
         LABELS = {
             "IDLE": "休息中",
@@ -627,6 +788,15 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             self._metrics_font.setFamilies(["幼圆", "Microsoft YaHei UI"])
             self._metrics = QFontMetrics(self._metrics_font)
             self.model = AnimationModel(manifest)
+            self.scheduler = ActionScheduler(
+                self.model,
+                cooldown_ms=env_int("DSH_DAFEIYU_ACTION_COOLDOWN_MS", 800),
+                dwell_ms=env_int("DSH_DAFEIYU_ACTION_DWELL_MS", 1500),
+                now_ms=self._now_ms(),
+            )
+            self.show_stats = os.environ.get("DSH_DAFEIYU_SHOW_STATS", "1") != "0"
+            self.stats_cap_cny = env_int("DSH_DAFEIYU_BALANCE_CAP_CNY", 1000)
+            self.stats: dict[str, Any] = {}
             self.pixmaps: dict[str, QPixmap] = {}
             for clip in self.model.clips.values():
                 for frame in clip.frames:
@@ -689,6 +859,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             self._hover_timer.setInterval(150)
             self._hover_timer.timeout.connect(self._on_hover_settle)
             self.card = StatusCard()
+            self.stats_bar = StatsBar()
             self.last_tick_ms = self._now_ms()
             self.fade_from_pixmap: QPixmap | None = None
             self.fade_started = 0.0
@@ -735,6 +906,20 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                     self.model.base_state,
                     None if self.model.base_state in {"THINKING", "WORKING", "WAITING", "ERROR"} else 6000,
                 )
+            elif kind == "stats":
+                self.stats = {
+                    "todayCny": message.get("todayCny"),
+                    "monthCny": message.get("monthCny"),
+                    "balanceCny": message.get("balanceCny"),
+                    "bonusCny": message.get("bonusCny"),
+                    "balanceCapCny": message.get("balanceCapCny", self.stats_cap_cny),
+                    "balanceBarMaxCny": message.get("balanceBarMaxCny"),
+                    "updatedAt": message.get("updatedAt"),
+                }
+                self.stats_bar.set_payload(self.stats)
+                self._sync_stats_bar()
+                self.update()
+                return
             elif kind == "config":
                 self._apply_config(message)
             elif kind == "question":
@@ -769,7 +954,9 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                     )
                 else:
                     activity = None if self.reduced_motion else message.get("activity")
-                    self.model.apply_state(state, activity)
+                    # The pose change is queued and paced; the text below is
+                    # still updated on every event.
+                    self.scheduler.request_state(state, activity, self._now_ms())
                     self._clear_overlay()
                     persistent = state in {"THINKING", "WORKING", "WAITING", "ERROR"}
                     self._show_status(
@@ -893,7 +1080,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 "sessionId": str(message.get("sessionId", "")),
                 "callId": str(message.get("callId", "")),
             }
-            self.model.apply_state("WAITING")
+            self.scheduler.force_state("WAITING", None, self._now_ms())
 
             count = len(questions)
             first = questions[0] if isinstance(questions[0], dict) else {}
@@ -954,7 +1141,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 self._question_meta = {}
                 self._hide_question_bubble()
                 # Back to the state the activity feed reports.
-                self.model.apply_state(self.display_state or "IDLE")
+                self.scheduler.force_state(self.display_state or "IDLE", None, self._now_ms())
                 emit_reply("question_answer", sessionId=meta["sessionId"], callId=meta["callId"], answer=answers)
                 return
 
@@ -963,7 +1150,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             current = len(self._question_answers) + 1
 
             # The pet switches to its WAITING pose while a question is open.
-            self.model.apply_state("WAITING")
+            self.scheduler.force_state("WAITING", None, self._now_ms())
 
             def build_answer(selected, custom):
                 return {
@@ -1124,7 +1311,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             self._question_queue = []
             self._question_meta = {}
             self._hide_question_bubble()
-            self.model.apply_state(self.display_state or "IDLE")
+            self.scheduler.force_state(self.display_state or "IDLE", None, self._now_ms())
             emit_reply("question_skip", sessionId=meta.get("sessionId", ""), callId=meta.get("callId", ""), skip=True)
             web_url = os.environ.get("DSH_WEB_URL", "").strip()
             if not web_url:
@@ -1153,7 +1340,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             self._question_queue = []
             self._question_meta = {}
             self._hide_question_bubble()
-            self.model.apply_state(self.display_state or "IDLE")
+            self.scheduler.force_state(self.display_state or "IDLE", None, self._now_ms())
 
         def _track_task_activity(self, state: str) -> None:
             """Update the task-active flag on state transitions.
@@ -1194,8 +1381,21 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 self.activity_level = activity_level
                 if not self.reduced_motion:
                     self._schedule_micro()
+            show_stats = message.get("showStats")
+            if isinstance(show_stats, bool):
+                self.show_stats = show_stats
+            cap = message.get("balanceCapCny")
+            if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+                self.stats_cap_cny = float(cap)
+                self.stats["balanceCapCny"] = float(cap)
+                self.stats["balanceBarMaxCny"] = money_bar_max(float(cap))
+            self.scheduler.configure(
+                cooldown_ms=message.get("actionCooldownMs"),
+                dwell_ms=message.get("actionDwellMs"),
+            )
             self._apply_window_size()
             self._move_to_pet(self.pet_x, self.pet_y)
+            self._sync_stats_bar()
             self._save_layout()
 
         def _tick(self) -> None:
@@ -1205,6 +1405,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             had_pulse = self.model.pulse_state is not None
             model_elapsed = 0 if self.reduced_motion and self.model.active_clip.loop else elapsed_ms
             self.model.advance(model_elapsed, now_ms)
+            self.scheduler.tick(now_ms)
             # Preserve crisp facial expressions; soften larger pose and frame changes.
             EXPRESSION_CLIPS = {"blink", "glance"}
             frame_name = self.model.frame
@@ -1221,16 +1422,24 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 self.last_frame_name = frame_name
             if had_pulse and self.model.pulse_state is None:
                 self.display_state = self.model.base_state
+                self.scheduler.note_passive_switch(now_ms)
             if self.overlay_deadline_ms is not None and now_ms >= self.overlay_deadline_ms:
                 self._clear_overlay()
             self._maybe_update_dock()
             self._sync_card()
+            self._sync_stats_bar()
             self.update()
 
         def _play_idle_micro(self) -> None:
             if self.reduced_motion:
                 return
-            self.model.play_idle_micro(random.randrange(max(1, len(self.model.idle_micro_clips))))
+            clips = self.model.idle_micro_clips
+            if (clips
+                    and self.model.base_state == "IDLE"
+                    and self.model.overlay_clip_name is None
+                    and self.model.pulse_state is None):
+                clip = clips[random.randrange(len(clips))]
+                self.scheduler.request_micro(clip, self._now_ms())
             self._schedule_micro()
 
         def _schedule_micro(self) -> None:
@@ -1521,6 +1730,9 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 return
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             self.snapshot_saved = self.grab().save(str(snapshot_path), "PNG")
+            if self.stats_bar.isVisible():
+                side = snapshot_path.with_name(f"{snapshot_path.stem}-stats{snapshot_path.suffix}")
+                self.stats_bar.grab().save(str(side), "PNG")
 
         def _show_status(self, message: str, detail: str, state: str, ttl_ms: int | None) -> None:
             self.status_message = message
@@ -1584,6 +1796,24 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 self.card.show_card(title, detail, self.pet_x + pet_w // 2, self.pet_y)
             else:
                 self.card.hide()
+
+        def _sync_stats_bar(self) -> None:
+            """Keep the CNY strip attached just below the pet (above when docked)."""
+            if not self.show_stats:
+                self.stats_bar.conceal()
+                return
+            pet_w, pet_h = self._pet_size()
+            payload = dict(self.stats)
+            payload.setdefault("balanceCapCny", self.stats_cap_cny)
+            if not payload.get("balanceBarMaxCny"):
+                payload["balanceBarMaxCny"] = money_bar_max(self.stats_cap_cny)
+            self.stats_bar.set_payload(payload)
+            width = max(StatsBar.MIN_WIDTH, min(StatsBar.MAX_WIDTH, pet_w + 70))
+            center_x = self.pet_x + pet_w // 2
+            if self._docked:
+                self.stats_bar.sync(center_x, self.pet_y - 8, above=True, width=width)
+            else:
+                self.stats_bar.sync(center_x, self.pet_y + pet_h + 8, above=False, width=width)
 
         def _draw_status_icon(self, painter: QPainter, state: str, center_x: int, center_y: int) -> None:
             background, foreground = self._status_colors(state)
@@ -1785,7 +2015,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             if self.drag_origin is not None and self.pet_origin is not None:
                 if not self.dragging and (event.globalPosition().toPoint() - self.drag_origin).manhattanLength() > 5:
                     self.dragging = True
-                    self.model.play_overlay("dragging")
+                    self.scheduler.force_overlay("dragging", self._now_ms())
                 delta = event.globalPosition().toPoint() - self.drag_origin
                 self._move_to_pet(self.pet_origin.x() + delta.x(), self.pet_origin.y() + delta.y())
 
@@ -1793,6 +2023,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             if event.button() == Qt.MouseButton.LeftButton:
                 if self.dragging:
                     self.model.clear_overlay()
+                    self.scheduler.note_passive_switch(self._now_ms())
                     self._move_to_pet(self.pet_x, self.pet_y)
                     self._full_pet = (self.pet_x, self.pet_y)
                     self._docked = False
@@ -1807,6 +2038,10 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             self.drag_origin = None
             self.pet_origin = None
             self.dragging = False
+
+        def _play_reaction(self, clip: str) -> bool:
+            """Click-driven reactions stay immediate but never stack up."""
+            return self.scheduler.request_interaction(clip, self._now_ms())
 
         def _play_click_interaction(self, x: float, y: float) -> None:
             pet_x, pet_y, pet_width, pet_height = self._pet_rect()
@@ -1869,7 +2104,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
 
         def _present_balance(self, ok: bool, title: str, detail: str) -> None:
             if ok:
-                self.model.play_overlay("head_pat")
+                self._play_reaction("head_pat")
                 self._show_overlay(title, detail, "SUCCESS", 4000)
                 return
             x, y, w, h = self._balance_click_ctx
@@ -1879,7 +2114,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 self._show_overlay(title, detail, self.status_state, 3000)
 
         def _show_task_progress(self) -> None:
-            self.model.play_overlay("poke")
+            self._play_reaction("poke")
             progress = ""
             if self.task:
                 progress = f"「{self.task}」"
@@ -1923,13 +2158,13 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
             if zone == "other":
                 # 通用兜底：偶尔掏出扫把扫一扫
                 if random.random() < 0.3:
-                    self.model.play_overlay("sweeping")
+                    self._play_reaction("sweeping")
                     self._show_overlay("拿扫把扫一扫，把摸鱼痕迹都扫掉~", "拿扫把扫", self.status_state, 2400)
                     return
                 clip, detail, part_lines = "head_pat", "吃白饭的蓝色大肥鱼·日常", PLAYFUL_GENERIC
             else:
                 clip, detail, part_lines = ZONE_CLIP_DETAIL_LINES[zone]
-                self.model.play_overlay(clip)
+                self._play_reaction(clip)
 
             count = self.zone_clicks.get(zone, 0) + 1
             self.zone_clicks[zone] = count
@@ -1937,7 +2172,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
                 picked_zone, line = random.choice(PLAYFUL_ALL_TAGGED)
                 if picked_zone != "generic":
                     clip, new_detail, _ = ZONE_CLIP_DETAIL_LINES[picked_zone]
-                    self.model.play_overlay(clip)
+                    self._play_reaction(clip)
                     detail = new_detail
             else:
                 line = random.choice(part_lines)
@@ -2033,6 +2268,11 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None, quest
 
 def main() -> int:
     configure_stdio()
+    if os.environ.get("DSH_DAFEIYU_DEBUG_STACK") == "1":
+        # Diagnostic: dump every thread's stack to stderr every 10s so a frozen
+        # packaged helper can be diagnosed without a debugger.
+        import faulthandler
+        faulthandler.dump_traceback_later(10, repeat=True)
     parser = argparse.ArgumentParser(description="DSH BigFish native helper")
     parser.add_argument("--headless", action="store_true", help="validate the protocol without opening a window")
     parser.add_argument("--event-log", type=Path, help="append received protocol messages to a JSONL file")

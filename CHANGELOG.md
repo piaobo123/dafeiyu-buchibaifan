@@ -1,5 +1,33 @@
 # Changelog
 
+## 未发布 — 动作节奏与人民币费用统计
+
+> 动作不再按每条 session 事件瞬时切换；桌宠下方常驻显示今日/本月消耗与账户余额（人民币）。
+> 同时修复两处打包名错误（启用即报错），以及 one-file 打包后布局落盘可能卡死的问题。
+
+### 修复
+
+- **启用报错 `ERR_MODULE_NOT_FOUND`**：`cordis.patch.yml` 的入口 `name` 必须是可安装包名，改为 `@piaobo_gz/dafeiyu-buchibaifan`（`id` 仍为 `dafeiyu-buchibaifan`）。原短 id 会让 loader 从 profile 根目录 import 一个不存在的包。
+- **前端报 `loaded without registering ...`**：`lib/client.js` 的 `__ModuleLoader__.load({ id })` 同步改为完整包名；`settings.plugin.item` 槽位 id 不变。
+- **布局落盘死锁**：`runtime/layout_store.py` 不再使用 `tempfile.mkstemp`（PyInstaller one-file 打包后，该调用在部分 Windows 环境会永久卡住），改为固定进程内临时名 `.layout.json.<pid>.tmp` + `os.replace`。
+
+### 新增
+
+- **动作调度器**（`runtime/animation_model.py` 的 `ActionScheduler`，无 Qt 依赖）：
+  - 状态请求合流（突发只保留最新），队列上限 8；
+  - 全局冷却 `actionCooldownMs`（默认 800）与最小停留 `actionDwellMs`（默认 1500）；
+  - `WAITING`/`ERROR` 可 250ms 紧急抢占；
+  - 微动作全局 26s / 同动作 90s CD；点击反应 400ms 间隔、同动作 1.2s 内不重复；
+  - 状态文本与卡片仍即时更新，仅姿态被节流。
+- **人民币费用统计**（`src/usage-stats.js`）：
+  - 按 `sessionQuery` 读取会话日志，fold `(provider, model, day)` 用量单元（与官方 token-pet 相同事件形状）；
+  - 按 DeepSeek 官方高峰/空闲人民币单价、以每条 usage 事件的发生时间计价；`deepseek-flash` 显式列价（缺行会落到兜底价导致金额虚高）；
+  - 余额取 `deepseekAccount.getBalance()`（平台钱包，实际值），赠送额度单独返回；
+  - 新增 `stats` 协议消息，宿主在启动、每 60s、回合结束（2s 防抖）与设置变更时推送；helper 重启后由快照补发。
+- **桌宠下方统计条**（`runtime/helper.py` 的 `StatsBar`）：今日 / 本月 / 余额三列，余额进度条按 1000 → 10000 → 100000 的十进制档位取整（最低 1000，如基准 235 按 1000 显示），低余额换色；`showStats=false` 时隐藏，贴角收进时改贴宠物上方。
+- **设置面板**：统计区（含 token 明细、更新时间、刷新按钮）与四个新控件（显示费用条、余额进度条基准、动作切换间隔、动作停留）；新增回环接口 `GET /plugins/dafeiyu-buchibaifan/stats`。
+- **测试**：`scripts/test-action-scheduler.py`（7 项时序断言，`py -3` 直接运行）。
+
 ## 1.0.7 — 重新发布（内容同 1.0.6）
 
 > 1.0.6 的发布请求被 registry 以 HTTP 202 受理后一直停留在处理中（`npm publish` 再次提交返回 `409 Cannot publish over previously staged version "1.0.6"`，版本号被占），内容不变、以 1.0.7 重新发布。1.0.6 未在 npm 生效，功能与代码与 1.0.7 完全一致。

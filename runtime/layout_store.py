@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -63,16 +62,18 @@ def load_layout(path: Path) -> dict[str, Any]:
 def save_layout(path: Path, value: dict[str, Any]) -> None:
     layout = normalise_layout(value)
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    # A fixed per-process temp name avoids `tempfile.mkstemp`, whose random-name
+    # sequence deadlocked inside the PyInstaller one-file helper on Windows.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
             json.dump(layout, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
+        os.replace(temporary, path)
     finally:
         try:
-            Path(temporary_name).unlink()
+            temporary.unlink()
         except FileNotFoundError:
             pass

@@ -1,4 +1,7 @@
 import Schema from '@deepseek-ai/schemastery'
+import { mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { CompanionReducer } from './companion-reducer.js'
 import { HelperProcess } from './helper-process.js'
 import {
@@ -6,10 +9,18 @@ import {
   CompanionState,
   createMessage,
 } from './protocol.js'
+import { balanceBarMax, collectUsage, formatCny } from './usage-stats.js'
+
+/** A writable scratch dir for the one-file helper (its bootloader extracts here). */
+export function helperTempDir() {
+  const home = process.env.DSH_HOME?.trim()
+  return join(home ? home : join(homedir(), '.dsh'), 'dsh-dafeiyu', 'runtime')
+}
 
 export const name = 'dafeiyu-buchibaifan'
 export const inject = ['sessions']
 export const CONFIG_ENDPOINT = '/plugins/dafeiyu-buchibaifan/config'
+export const STATS_ENDPOINT = '/plugins/dafeiyu-buchibaifan/stats'
 export const Config = Schema.object({
   enabled: Schema.boolean().default(true).description('启用桌面大肥鱼'),
   scale: Schema.number().min(0.5).max(1.4).step(0.05).default(1).role('slider').description('角色大小'),
@@ -22,6 +33,10 @@ export const Config = Schema.object({
   reducedMotion: Schema.boolean().default(false).description('减少走动、循环帧和程序化晃动'),
   includeSubagents: Schema.boolean().default(false).description('允许子 Agent 抢占宠物状态'),
   useSeparateCard: Schema.boolean().default(true).role('switch').description('状态/余额卡片用独立悬浮窗口（始终在屏幕内；关闭则用回旧的窗口内手绘卡片）'),
+  showStats: Schema.boolean().default(true).role('switch').description('在桌宠下方常驻显示今日消耗 / 本月消耗 / 余额'),
+  balanceCapCny: Schema.number().min(100).max(20000).step(100).default(1000).role('slider').description('余额进度条基准额度（元）；进度条按整千向上取整，最低 1000'),
+  actionCooldownMs: Schema.number().min(200).max(4000).step(50).default(800).role('slider').description('两次动作切换之间的最小间隔（毫秒）'),
+  actionDwellMs: Schema.number().min(400).max(6000).step(100).default(1500).role('slider').description('每个动作至少停留多久才允许切换（毫秒）'),
 }).description('由 DeepSeek Harness 状态驱动的桌面大肥鱼伴侣')
 
 const defaults = Object.freeze({
@@ -32,7 +47,16 @@ const defaults = Object.freeze({
   reducedMotion: false,
   includeSubagents: false,
   useSeparateCard: true,
+  showStats: true,
+  balanceCapCny: 1000,
+  actionCooldownMs: 800,
+  actionDwellMs: 1500,
 })
+
+function normalizeCapCny(value) {
+  const numeric = typeof value === 'number' && Number.isFinite(value) ? value : defaults.balanceCapCny
+  return Math.max(100, Math.min(20000, numeric))
+}
 
 function publicConfig(config = {}) {
   return {
@@ -43,6 +67,10 @@ function publicConfig(config = {}) {
     reducedMotion: config.reducedMotion ?? defaults.reducedMotion,
     includeSubagents: config.includeSubagents ?? defaults.includeSubagents,
     useSeparateCard: config.useSeparateCard ?? defaults.useSeparateCard,
+    showStats: config.showStats ?? defaults.showStats,
+    balanceCapCny: normalizeCapCny(config.balanceCapCny),
+    actionCooldownMs: config.actionCooldownMs ?? defaults.actionCooldownMs,
+    actionDwellMs: config.actionDwellMs ?? defaults.actionDwellMs,
   }
 }
 
@@ -175,7 +203,135 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       activityLevel: next.activityLevel ?? defaults.activityLevel,
       reducedMotion: next.reducedMotion === true,
       useSeparateCard: next.useSeparateCard !== false,
+      showStats: next.showStats !== false,
+      balanceCapCny: next.balanceCapCny ?? defaults.balanceCapCny,
+      actionCooldownMs: next.actionCooldownMs ?? defaults.actionCooldownMs,
+      actionDwellMs: next.actionDwellMs ?? defaults.actionDwellMs,
     }))
+  }
+
+  // --- Chinese-yuan cost strip (today / month / balance) ------------------
+  // Token usage is folded from the DSH session corpus; the balance comes from
+  // the platform account service (exact), while the cost figures are list-price
+  // estimates because DeepSeek bills peak hours at twice the off-peak rate.
+  const usageCache = new Map()
+  let latestStats
+  let statsInFlight = false
+  let statsTimer
+  let statsDebounceTimer
+  let lastStatsSignature = ''
+
+  const readWalletCny = async () => {
+    const account = ctx.get('deepseekAccount', false)
+    if (!account?.getBalance) return undefined
+    try {
+      const result = await account.getBalance({
+        version: '1.0.0',
+        locale: 'zh-CN',
+        timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+      })
+      if (result?.status !== 'ready') return undefined
+      const pick = (wallets) => {
+        const list = Array.isArray(wallets) ? wallets : []
+        const cny = list.find((wallet) => wallet?.currency === 'CNY')
+        if (cny) return Number(cny.balance)
+        const usd = list.find((wallet) => wallet?.currency === 'USD')
+        if (usd) return Number(usd.balance) * 7.2
+        return undefined
+      }
+      const balance = pick(result.value)
+      const bonus = pick(result.bonusWallets)
+      return {
+        balanceCny: Number.isFinite(balance) ? balance : undefined,
+        bonusCny: Number.isFinite(bonus) ? bonus : undefined,
+      }
+    } catch (error) {
+      logger.warn?.(`dsh-dafeiyu balance lookup failed: ${error.message}`)
+      return undefined
+    }
+  }
+
+  const computeStats = async (reason) => {
+    const now = Date.now()
+    let usage
+    try {
+      const sessionQuery = ctx.get('sessionQuery', false)
+      usage = await collectUsage(sessionQuery, usageCache, now)
+    } catch (error) {
+      logger.warn?.(`dsh-dafeiyu usage scan failed: ${error.message}`)
+    }
+    const wallet = await readWalletCny()
+    const live = settings.get()
+    return {
+      todayCny: usage?.todayCny ?? null,
+      monthCny: usage?.monthCny ?? null,
+      balanceCny: wallet?.balanceCny ?? null,
+      bonusCny: wallet?.bonusCny ?? null,
+      balanceCapCny: normalizeCapCny(live.balanceCapCny),
+      balanceBarMaxCny: balanceBarMax(normalizeCapCny(live.balanceCapCny)),
+      day: usage?.day ?? null,
+      month: usage?.month ?? null,
+      todayTokens: usage?.todayTokens ?? null,
+      monthTokens: usage?.monthTokens ?? null,
+      todayTotal: usage?.todayTotal ?? null,
+      monthTotal: usage?.monthTotal ?? null,
+      byModel: usage?.byModel ?? [],
+      currency: 'CNY',
+      estimate: true,
+      updatedAt: now,
+      reason,
+    }
+  }
+
+  const pushStats = async (reason = 'timer', force = false) => {
+    if (statsInFlight) return
+    statsInFlight = true
+    try {
+      const next = await computeStats(reason)
+      latestStats = next
+      const signature = [next.todayCny, next.monthCny, next.balanceCny]
+        .map((value) => (typeof value === 'number' ? value.toFixed(4) : 'x'))
+        .join('|')
+      if (!force && signature === lastStatsSignature) return
+      lastStatsSignature = signature
+      bridge?.send(createMessage(CompanionMessageKind.STATS, {
+        todayCny: next.todayCny,
+        monthCny: next.monthCny,
+        balanceCny: next.balanceCny,
+        bonusCny: next.bonusCny,
+        balanceCapCny: next.balanceCapCny,
+        balanceBarMaxCny: next.balanceBarMaxCny,
+        estimate: true,
+        updatedAt: next.updatedAt,
+      }))
+    } catch (error) {
+      logger.warn?.(`dsh-dafeiyu stats push failed: ${error.message}`)
+    } finally {
+      statsInFlight = false
+    }
+  }
+
+  const scheduleStatsRefresh = (delayMs = 2000) => {
+    if (statsDebounceTimer) clearTimeout(statsDebounceTimer)
+    statsDebounceTimer = setTimeout(() => {
+      statsDebounceTimer = undefined
+      void pushStats('session')
+    }, delayMs)
+    statsDebounceTimer.unref?.()
+  }
+
+  const startStatsLoop = () => {
+    if (statsTimer) return
+    setTimeout(() => { void pushStats('start', true) }, 1500).unref?.()
+    statsTimer = setInterval(() => { void pushStats('timer') }, 60_000)
+    statsTimer.unref?.()
+  }
+
+  const stopStatsLoop = () => {
+    if (statsTimer) clearInterval(statsTimer)
+    statsTimer = undefined
+    if (statsDebounceTimer) clearTimeout(statsDebounceTimer)
+    statsDebounceTimer = undefined
   }
 
   const scheduleRestart = (next) => {
@@ -403,17 +559,31 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       return
     }
     const helperConfig = config.helper ?? {}
+    const helperTemp = helperTempDir()
+    try {
+      mkdirSync(helperTemp, { recursive: true })
+    } catch (error) {
+      logger.warn?.(`dsh-dafeiyu helper temp dir failed: ${error.message}`)
+    }
     const apiKey = await resolveApiKey()
     if (apiKey === undefined) scheduleApiKeyRetry()
     bridge = new HelperProcess({
       ...helperConfig,
       env: {
         ...helperConfig.env,
+        // The one-file bootloader extracts itself; point it at a directory the
+        // helper can always write even when the inherited TEMP is unusable.
+        TEMP: helperTemp,
+        TMP: helperTemp,
         DSH_DAFEIYU_SCALE: String(resolved.scale ?? defaults.scale),
         DSH_DAFEIYU_BUBBLE_SCALE: String(resolved.bubbleScale ?? defaults.bubbleScale),
         DSH_DAFEIYU_ACTIVITY_LEVEL: String(resolved.activityLevel ?? defaults.activityLevel),
         DSH_DAFEIYU_REDUCED_MOTION: resolved.reducedMotion === true ? '1' : '0',
         DSH_DAFEIYU_USE_SEPARATE_CARD: resolved.useSeparateCard === false ? '0' : '1',
+        DSH_DAFEIYU_SHOW_STATS: resolved.showStats === false ? '0' : '1',
+        DSH_DAFEIYU_BALANCE_CAP_CNY: String(resolved.balanceCapCny ?? defaults.balanceCapCny),
+        DSH_DAFEIYU_ACTION_COOLDOWN_MS: String(resolved.actionCooldownMs ?? defaults.actionCooldownMs),
+        DSH_DAFEIYU_ACTION_DWELL_MS: String(resolved.actionDwellMs ?? defaults.actionDwellMs),
         ...(apiKey === undefined ? {} : { DSH_DAFEIYU_API_KEY: apiKey }),
         // Explicitly hand the web URL to the helper so its "open in browser"
         // escape hatch can raise/activate the DSH page.
@@ -438,6 +608,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       detail: 'DSH · 等待下一次任务',
     }))
     logger.info?.('dsh-dafeiyu companion bridge started')
+    startStatsLoop()
   }
 
   void startRuntime(settings.get())
@@ -446,6 +617,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
   // live inside a scoped composition, so use the unscoped root bus and dispose
   // the registrations explicitly with this plugin's lifecycle.
   const offEvent = eventCtx.on('session/event', (session, event) => {
+    if (event?.type === 'turn/end') scheduleStatsRefresh()
     if (!bridge || !reducer) return
     for (const message of reducer.handle(session, event)) bridge.send(message)
   }, { global: true })
@@ -453,6 +625,10 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     if (!bridge || !reducer) return
     for (const message of reducer.disposeSession(session)) bridge.send(message)
   }, { global: true })
+
+  let lastStatSettings = ''
+  const statSettingsKey = (next) =>
+    `${next.showStats !== false}|${next.balanceCapCny ?? defaults.balanceCapCny}`
 
   const unwatch = settings.watch((next) => {
     // Disabling is the only path that tears the helper down.  Every other
@@ -476,12 +652,42 @@ function mount(ctx, config = {}, eventCtx = ctx) {
       restartTimer = undefined
     }
     applyLiveSettings(next)
+    const key = statSettingsKey(next)
+    if (key !== lastStatSettings) {
+      lastStatSettings = key
+      void pushStats('settings', true)
+    }
   })
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer'], (httpCtx) => {
       httpCtx.effect(
         () => httpCtx.webServer.register({ kind: 'exact', path: CONFIG_ENDPOINT, handler: createConfigHandler(settings) }),
         'dsh-dafeiyu: local settings endpoint',
+      )
+      httpCtx.effect(
+        () => httpCtx.webServer.register({
+          kind: 'exact',
+          path: STATS_ENDPOINT,
+          handler: async (req, res) => {
+            if (!isLoopback(req.socket?.remoteAddress)) {
+              jsonResponse(res, 403, { error: 'local access only' })
+              return
+            }
+            if (req.method !== 'GET') {
+              jsonResponse(res, 405, { error: 'method not allowed' })
+              return
+            }
+            await pushStats('panel', true)
+            const payload = latestStats ?? { updatedAt: Date.now() }
+            jsonResponse(res, 200, {
+              ...payload,
+              todayLabel: formatCny(payload.todayCny),
+              monthLabel: formatCny(payload.monthCny),
+              balanceLabel: formatCny(payload.balanceCny),
+            })
+          },
+        }),
+        'dsh-dafeiyu: local stats endpoint',
       )
       // The mux stream is served by the same webserver; subscribe once it is up.
       httpCtx.effect(
@@ -502,6 +708,7 @@ function mount(ctx, config = {}, eventCtx = ctx) {
     offDisposed?.()
     unwatch()
     stopMux()
+    stopStatsLoop()
     stopRuntime('dsh-host-stop')
   })
 }

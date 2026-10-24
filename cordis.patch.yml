@@ -1,6 +1,12 @@
+# Bundle patch layer for @piaobo_gz/dafeiyu-buchibaifan.
+#
+# `name` is the module specifier the DSH loader imports from the profile root,
+# so it must be the installable package name. Upstream 1.0.7 shipped the short
+# id `dafeiyu-buchibaifan` here, which the loader tries to import as a package
+# and fails with ERR_MODULE_NOT_FOUND; `id` stays the short id.
 - insert:
     - id: dafeiyu-buchibaifan
-      name: dafeiyu-buchibaifan
+      name: '@piaobo_gz/dafeiyu-buchibaifan'
       config:
         enabled: true
         scale: 1
